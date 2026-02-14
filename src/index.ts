@@ -43,20 +43,20 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 async function main(): Promise<void> {
-  try {
-    console.log('Connecting to WhatsApp...');
-    await whatsappService.connect();
-    
-    app.listen(config.port, '0.0.0.0', () => {
-      console.log(`\nWhatsApp REST API server running on 0.0.0.0:${config.port}`);
-      console.log(`Health check: http://localhost:${config.port}/health`);
-      console.log(`Send message: POST http://localhost:${config.port}/send`);
-      console.log(`\nAllowed phones: ${config.allowedPhones.join(', ')}`);
-    });
-  } catch (error) {
-    console.error('Failed to start server:', error);
-    process.exit(1);
-  }
+  // Start HTTP server immediately (don't wait for WhatsApp)
+  app.listen(config.port, '0.0.0.0', () => {
+    console.log(`\nWhatsApp REST API server running on 0.0.0.0:${config.port}`);
+    console.log(`Health check: http://localhost:${config.port}/health`);
+    console.log(`Send message: POST http://localhost:${config.port}/send`);
+    console.log(`\nAllowed phones: ${config.allowedPhones.join(', ')}`);
+  });
+
+  // Connect to WhatsApp in background
+  console.log('Connecting to WhatsApp...');
+  whatsappService.connect().catch((error) => {
+    console.error('WhatsApp connection failed:', error);
+    // Don't exit - allow health check to report disconnected status
+  });
 }
 
 main();
