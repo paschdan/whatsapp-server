@@ -1,0 +1,155 @@
+import makeWASocket, {
+  useMultiFileAuthState,
+  DisconnectReason,
+  WASocket,
+  fetchLatestBaileysVersion,
+} from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
+import pino from 'pino';
+import qrcode from 'qrcode-terminal';
+import { config, normalizePhoneToJid } from '../config/index.js';
+
+export interface SendMessageResult {
+  success: boolean;
+  messageId?: string;
+  error?: string;
+}
+
+const QR_SCAN_TIMEOUT_MS = 120000;
+const RECONNECT_DELAY_MS = 3000;
+
+export class WhatsAppService {
+  private sock: WASocket | null = null;
+  private isConnecting = false;
+  private connectionPromise: Promise<void> | null = null;
+  private logger: pino.Logger;
+
+  constructor() {
+    this.logger = pino({
+      level: config.logLevel,
+    });
+  }
+
+  async connect(): Promise<void> {
+    if (this.isConnecting && this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    this.isConnecting = true;
+    this.connectionPromise = this.initConnection();
+
+    try {
+      await this.connectionPromise;
+    } finally {
+      this.isConnecting = false;
+      this.connectionPromise = null;
+    }
+  }
+
+  private async initConnection(): Promise<void> {
+    const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
+    const { version } = await fetchLatestBaileysVersion();
+
+    this.logger.info({ version }, 'Connecting to WhatsApp...');
+
+    this.sock = makeWASocket({
+      version,
+      logger: this.logger.child({ module: 'baileys' }) as any,
+      auth: state,
+      markOnlineOnConnect: false,
+    });
+
+    this.sock.ev.on('creds.update', saveCreds);
+
+    this.sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        console.log('\n📱 Scan this QR code with WhatsApp (Linked Devices):\n');
+        qrcode.generate(qr, { small: true });
+      }
+
+      if (connection === 'close') {
+        const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        this.logger.warn(
+          { statusCode, shouldReconnect },
+          'Connection closed'
+        );
+
+        if (shouldReconnect) {
+          this.logger.info('Attempting to reconnect...');
+          await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY_MS));
+          this.connect().catch((err) => {
+            this.logger.error({ err }, 'Reconnection failed');
+          });
+        } else {
+          this.logger.error(
+            'Logged out from WhatsApp. Please delete auth_info folder and restart to re-authenticate.'
+          );
+        }
+      } else if (connection === 'open') {
+        this.logger.info('WhatsApp connection established successfully!');
+      }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error('Connection timeout - please scan QR code'));
+      }, QR_SCAN_TIMEOUT_MS);
+
+      this.sock!.ev.on('connection.update', (update) => {
+        if (update.connection === 'open') {
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+    });
+  }
+
+  async sendMessage(phone: string, text: string): Promise<SendMessageResult> {
+    if (!this.sock) {
+      return {
+        success: false,
+        error: 'WhatsApp not connected',
+      };
+    }
+
+    try {
+      const jid = normalizePhoneToJid(phone);
+      this.logger.info({ jid, textLength: text.length }, 'Sending message');
+
+      const result = await this.sock.sendMessage(jid, { text });
+
+      this.logger.info({ messageId: result?.key?.id }, 'Message sent successfully');
+
+      return {
+        success: true,
+        messageId: result?.key?.id ?? undefined,
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error({ error: errorMessage, phone }, 'Failed to send message');
+
+      return {
+        success: false,
+        error: errorMessage,
+      };
+    }
+  }
+
+  isConnected(): boolean {
+    return this.sock !== null;
+  }
+
+  async disconnect(): Promise<void> {
+    if (this.sock) {
+      this.logger.info('Disconnecting from WhatsApp...');
+      this.sock.end(undefined);
+      this.sock = null;
+    }
+  }
+}
+
+export const whatsappService = new WhatsAppService();
